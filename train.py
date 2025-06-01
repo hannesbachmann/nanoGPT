@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from evaluation_methods import calc_perplexity
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -214,18 +215,22 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    out = {}
+    out_loss = {}
+    out_ppl = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        ppls = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+            ppls[k] = torch.exp(loss)
+        out_loss[split] = losses.mean()
+        out_ppl[split] = ppls.mean()
     model.train()
-    return out
+    return out_loss, out_ppl
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -261,8 +266,8 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        losses, ppls = estimate_loss()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} | train perplexity: {ppls['train']:.4f}, val perplexity: {ppls['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,

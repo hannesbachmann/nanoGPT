@@ -77,6 +77,8 @@ else:
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
+
+start = 'First Citizen:'
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
@@ -87,3 +89,16 @@ with torch.no_grad():
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(decode(y[0].tolist()))
             print('---------------')
+
+
+# single generation
+start = 'Hello'
+start_ids = encode(start)
+x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+# run generation
+with torch.no_grad():
+    with ctx:
+        y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+        print(decode(y[0].tolist()))
+        print('---------------')
