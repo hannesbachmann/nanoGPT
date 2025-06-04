@@ -85,15 +85,15 @@ class MultiheadLatentAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # special for multi-head latent:
         # Q-downproject
-        self.c_qd = nn.Linear(config.n_embd, config.n_embd // 2)
+        self.c_qd = nn.Linear(config.n_embd, config.n_embd // 4)
         # KV-downproject
-        self.c_kvd = nn.Linear(config.n_embd, config.n_embd // 2)
+        self.c_kvd = nn.Linear(config.n_embd, config.n_embd // 4)
         # Q-upprojection
-        self.c_qu = nn.Linear(config.n_embd // 2, config.n_embd)
+        self.c_qu = nn.Linear(config.n_embd // 4, config.n_embd)
         # K-upprojection
-        self.c_ku = nn.Linear(config.n_embd // 2, config.n_embd)
+        self.c_ku = nn.Linear(config.n_embd // 4, config.n_embd)
         # V-upprojection
-        self.c_vu = nn.Linear(config.n_embd // 2, config.n_embd)
+        self.c_vu = nn.Linear(config.n_embd // 4, 2 * config.n_embd)
         # produce decoupled keys
         self.c_kr = nn.Linear(config.n_embd, config.n_embd)
         # produce decoupled queries
@@ -102,7 +102,7 @@ class MultiheadLatentAttention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(2 * config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -129,17 +129,24 @@ class MultiheadLatentAttention(nn.Module):
         c_qu = self.c_qu(c_qd)
         # up-projection of key-value latent into separate key and value
         c_ku = self.c_ku(c_kvd)
-        c_vu = self.c_vu(c_kvd)
+        v = self.c_vu(c_kvd)
         # decoupled keys and queries
         c_kr = self.c_kr(x)
         c_qr = self.c_qr(c_qu)
 
+        # apply RoPE (rotary positional embedding) on the decoupled queries and keys
+        rope_q = apply_rope(c_qr)
+        rope_k = apply_rope(c_kr)
+
+        # concatenate queries and keys with their roped version
+        q = torch.cat([c_qu, rope_q], dim=-1)
+        k = torch.cat([c_ku, rope_k], dim=-1)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        # q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, 2 * C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, 2 * C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, 2 * C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -154,7 +161,7 @@ class MultiheadLatentAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, 2 * C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -186,10 +193,12 @@ def get_angles(dim, base=10000):
     return inv_freq
 
 
-def apply_rope(x, inv_freq):
+def apply_rope(x):
     # x: (batch, seq_len, dim)
     seq_len = x.shape[1]
-    pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)  # (seq_len, 1)
+    dim = x.shape[2]
+    inv_freq = get_angles(dim, base=10000).to(x.device)
+    pos = torch.arange(seq_len, dtype=torch.float32, device=x.device).unsqueeze(1)  # (seq_len, 1)
     sinusoid_inp = torch.einsum("i,j->ij", pos.squeeze(), inv_freq)  # (seq_len, dim // 2)
 
     sin = torch.sin(sinusoid_inp)
@@ -264,8 +273,8 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            # h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            h = nn.ModuleList([BlockMLA(config) for _ in range(config.n_layer)]),   # multi-head latent attention
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            # h = nn.ModuleList([BlockMLA(config) for _ in range(config.n_layer)]),   # multi-head latent attention
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -314,8 +323,8 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        # x = self.transformer.drop(tok_emb + pos_emb)  # use position embedding before transformer blocks
-        x = self.transformer.drop(tok_emb)      # in MLA use RoPE as positional embedding (inside the block)
+        x = self.transformer.drop(tok_emb + pos_emb)  # use position embedding before transformer blocks
+        # x = self.transformer.drop(tok_emb)      # in MLA use RoPE as positional embedding (inside the block)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
