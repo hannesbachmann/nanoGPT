@@ -85,15 +85,19 @@ class MultiheadLatentAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # special for multi-head latent:
         # Q-downproject
-        self.c_qd = nn.Linear(config.n_embd, config.n_embd // 2, bias=config.bias)
+        self.c_qd = nn.Linear(config.n_embd, config.n_embd // 2)
         # KV-downproject
-        self.c_kvd = nn.Linear(config.n_embd, config.n_embd // 2, bias=config.bias)
+        self.c_kvd = nn.Linear(config.n_embd, config.n_embd // 2)
         # Q-upprojection
         self.c_qu = nn.Linear(config.n_embd // 2, config.n_embd)
         # K-upprojection
         self.c_ku = nn.Linear(config.n_embd // 2, config.n_embd)
         # V-upprojection
         self.c_vu = nn.Linear(config.n_embd // 2, config.n_embd)
+        # produce decoupled keys
+        self.c_kr = nn.Linear(config.n_embd, config.n_embd)
+        # produce decoupled queries
+        self.c_qr = nn.Linear(config.n_embd, config.n_embd)
 
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -115,6 +119,21 @@ class MultiheadLatentAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # prepare for MLA
+        # down-projection of x for queries
+        c_qd = self.c_qd(x)
+        # down-projection of x for key and values
+        c_kvd = self.c_kvd(x)
+        # up-project of queries
+        c_qu = self.c_qu(c_qd)
+        # up-projection of key-value latent into separate key and value
+        c_ku = self.c_ku(c_kvd)
+        c_vu = self.c_vu(c_kvd)
+        # decoupled keys and queries
+        c_kr = self.c_kr(x)
+        c_qr = self.c_qr(c_qu)
+
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
